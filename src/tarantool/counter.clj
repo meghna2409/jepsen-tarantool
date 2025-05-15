@@ -1,82 +1,73 @@
 (ns tarantool.counter
-  "Incrementing a counter."
-  (:require [jepsen [client :as client]
-                    [checker :as checker]
-                    [generator :as gen]
-                    [independent :as independent]]
+  (:require [jepsen.client        :as client]
+            [jepsen.generator     :as gen]
+            [jepsen.independent   :as independent]
+            [jepsen.checker       :as checker]
             [jepsen.checker.timeline :as timeline]
-            [clojure.tools.logging :refer [debug info warn]]
-            [next.jdbc :as j]
-            [next.jdbc.sql :as sql]
-            [tarantool [client :as cl]
-                       [db :as db]]
-            [knossos.op :as op]))
+            [clojure.tools.logging :refer [info warn]]
+            [next.jdbc            :as j]
+            [tarantool.client     :as cl]
+            [tarantool.db         :as db]))
 
-(def table-name "counter")
+(def table "counter")
 
-(defrecord CounterClient [conn]
+(defrecord CounterClient [conn node]
   client/Client
 
-  (open! [this test node]
-    (let [conn (cl/open node test)]
-      (assert conn)
-      (assoc this :conn conn :node node)))
+  (open! [_ test node]
+    (let [c (cl/open node test)]
+      (assert c "tarantool.client.open returned nil!")
+      (assoc (CounterClient. c node)
+            :conn c :node node)))
+
 
   (setup! [this test node]
-    (let [conn (cl/open node test)]
-      (assert conn)
-      (Thread/sleep 10000) ; wait for leader election and joining to a cluster
-      (when (= node (first (db/primaries test)))
-        (cl/with-conn-failure-retry conn
-          (j/execute! conn [(str "CREATE TABLE IF NOT EXISTS " table-name
-                            " (id INT NOT NULL PRIMARY KEY,
-                            count INT NOT NULL)")]))
-          (sql/insert! conn table-name {:id 0 :count 0})
-          (let [table (clojure.string/upper-case table-name)]
-            (j/execute! conn [(str "SELECT LUA('return box.space." table ":alter{ is_sync = true } or 1')")])))
-      (assoc this :conn conn :node node)))
+    (let [this (client/open! this test node)      
+          conn (:conn this)]
+      (Thread/sleep 10000)                       
+      (when (= node (first (db/primaries test)))  
+        (j/execute! conn
+          [(format "CREATE TABLE IF NOT EXISTS %s (id INT PRIMARY KEY, cnt INT)" table)])
+        (j/execute! conn
+          [(format "INSERT OR IGNORE INTO %s VALUES (0,0)" table)]))
+      this))          
 
-  (invoke! [this test op]
-    (cl/with-error-handling op
-      (cl/with-txn-aborts op
-        (case (:f op)
-          :add (let [con (cl/open (first (db/primaries test)) test)]
-                 (do (j/execute! con
-                      [(str "UPDATE " table-name " SET count = count + ? WHERE id = 0") (:value op)]))
-               (assoc op :type :ok))
+(invoke! [this test op]
+  (let [conn (:conn this)
+        f (:f op)]
+    (try
+      (if (= f :add)
+        (do
+          (j/execute! conn
+            [(str "UPDATE " table " SET cnt = cnt + ? WHERE id = 0")
+             (:value op)])
+          (assoc op :type :ok))
+        (let [v (-> (j/execute! conn [(str "SELECT cnt FROM " table " WHERE id = 0")])
+                   first :cnt)]
+          (assoc op :type :ok :value v)))
+      (catch Exception e
+        (warn "counter op failed" (.getMessage e))
+        (assoc op :type :fail :error (.getMessage e))))))
+          
+  (teardown! [this test]
+    (when (and (= (:node this) (first (db/primaries test)))
+               (not (:leave-db-running? test)))
+      (j/execute! (:conn this) [(str "DROP TABLE IF EXISTS " table)])))
 
-          :read (let [value (:COUNT
-                  (first (sql/query conn
-                    [(str "SELECT count FROM " table-name " WHERE id = 0")])))]
-                (assoc op :type :ok :value value))))))
+  (close!   [this _] (some-> (:conn this) .close)))
 
-  (teardown! [_ test]
-    (when-not (:leave-db-running? test)
-      (cl/with-conn-failure-retry conn
-        (j/execute! conn [(str "DROP TABLE IF EXISTS " table-name)]))))
+(def add-op  {:type :invoke :f :add  :value 1})
+(def read-op {:type :invoke :f :read})
 
-  (close! [_ test]))
+(defn with-index [g]
+  (let [i (atom 0)]
+    (gen/map #(assoc % :op-index (swap! i inc)) g)))
 
-(def add {:type :invoke :f :add :value 1})
-(def r   {:type :invoke :f :read})
-
-(defn with-op-index
-  "Append :op-index integer to every operation emitted by the given generator.
-  Value starts at 1 and increments by 1 for every subsequent emitted operation."
-  [gen]
-  (let [ctr (atom 0)]
-    (gen/map (fn add-op-index [op]
-               (assoc op :op-index (swap! ctr inc)))
-             gen)))
-
-(defn workload-inc
-  [opts]
-  {:client    (CounterClient. nil)
-   :generator (->> (repeat 100 add)
-                   (cons r)
-                   gen/mix
-                   (gen/delay 1/10)
-                   (with-op-index))
-   :checker   (checker/compose
-                {:timeline (timeline/html)
-                 :counter  (checker/counter)})})
+(defn workload-inc [_opts]
+  {:client  (CounterClient. nil nil)
+   :checker (checker/compose
+              {:timeline (timeline/html)
+               :counter  (checker/counter)})
+   :generator (with-index
+                (gen/stagger 0.1
+                  (gen/mix (concat (repeat 90 add-op) (repeat 10 read-op)))))})

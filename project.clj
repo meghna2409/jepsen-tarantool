@@ -9,8 +9,13 @@
                  [expound "0.8.5"]
                  [seancorfield/next.jdbc "1.1.582"]
                  [org.tarantool/connector "1.9.4"]
-                 [com.stuartsierra/component "1.0.0"]]
+                 [com.stuartsierra/component "1.0.0"]
+                 [org.clojure/data.json "0.2.7"]] 
   :plugins [[lein-cljfmt "0.6.8"]]
   :repl-options {:init-ns tarantool.runner}
-  :jvm-opts ["-Djava.awt.headless=true -Xmx12G"]
+  :jvm-opts ["-Djava.awt.headless=true"
+             "-Xmx12G"
+             "-XX:MaxDirectMemorySize=4g"
+             "-XX:+UseG1GC"
+             "-XX:+PreserveFramePointer"]
   :aot [tarantool.runner])

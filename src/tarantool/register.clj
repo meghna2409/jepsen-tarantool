@@ -32,54 +32,100 @@
       (assoc this :conn conn :node node)))
 
   (setup! [this test node]
-    (let [conn (cl/open node test)]
-      (assert conn)
-      (Thread/sleep 10000) ; wait for leader election and joining to a cluster
-      (if (= node (first (db/primaries test)))
-        (cl/with-conn-failure-retry conn
-          (j/execute! conn [(str "CREATE TABLE IF NOT EXISTS " table-name
-                            " (id INT NOT NULL PRIMARY KEY,
-                            value INT NOT NULL)")])
-          (let [table (clojure.string/upper-case table-name)]
-            (j/execute! conn [(str "SELECT LUA('return box.space." table ":alter{ is_sync = true } or 1')")]))))
-      (assoc this :conn conn :node node)))
+    (info node "Setting up register client")
+    (let [this (client/open! this test node)
+          conn (:conn this)]
+            (Thread/sleep 10000)
 
-  (invoke! [this test op]
-   (let [[k value] (:value op)]
-     (case (:f op)
+      (when (= node (first (db/primaries test)))
+        (info node "Creating register table")
+        (try
+          (j/execute! conn
+            [(format "CREATE TABLE IF NOT EXISTS %s (id INT PRIMARY KEY, value INT)"
+                    table-name)])
+          (catch Exception e
+            (warn node "Error creating table:" (.getMessage e)))))
 
-       :read (let [r (first (sql/query conn [(str "SELECT value FROM " table-name " WHERE id = " k)]))
-                   v (:value r)]
-               (assoc op :type :ok, :value (independent/tuple k v)))
+      (Thread/sleep 5000)
+      (when (= node (first (db/primaries test)))
+        (info node "Making register table synchronous")
+        (let [tbl (str/upper-case table-name)]
+          (try
+            (j/execute! conn
+              [(format "SELECT LUA('local s = box.space.%s; if s then s:alter{is_sync=true} end')" tbl)])
+            (catch Exception e
+              (warn node "Error making table synchronous:" (.getMessage e))))))
 
-       :write (do (let [con (cl/open (first (db/primaries test)) test)
-                        table (clojure.string/upper-case table-name)]
-                    (j/execute! con
-                      [(str "SELECT _UPSERT(" k ", " value ", '" table "')")])
-                    (assoc op
-                           :type :ok
-                           :value (independent/tuple k value))))
+      this))
 
-       :cas (do (let [[old new] value
-                  con (cl/open (first (db/primaries test)) test)
-                  table (clojure.string/upper-case table-name)
-                  r (->> (j/execute! con
-                           [(str "SELECT _CAS(" k ", " old ", " new ", '" table "')")])
-                         (first)
-                         (vals)
-                         (first))]
+(invoke! [this test op]
+  (try
+    (let [[k value] (:value op)]
+      (case (:f op)
+        :read (let [result (sql/query (:conn this) [(str "SELECT value FROM " table-name " WHERE id = " k)])
+                    v (:value (first result))]
+                (info "Read successful:" k "value:" v)
+                (assoc op :type :ok, :value (independent/tuple k v)))
+
+        :write (do (let [con (cl/open (first (db/primaries test)) test)
+                         table (clojure.string/upper-case table-name)]
+                     (info "Attempting write" k "value:" value)
+                     (j/execute! con
+                       [(str "SELECT _UPSERT(" k ", " value ", '" table "')")])
+                     (info "Write successful:" k "value:" value)
+                     (assoc op :type :ok :value (independent/tuple k value))))
+
+        :cas (do (let [[old new] value
+                   con (cl/open (first (db/primaries test)) test)
+                   table (clojure.string/upper-case table-name)
+                   _ (info "Attempting CAS" k "from:" old "to:" new)
+                   r (->> (j/execute! con
+                            [(str "SELECT _CAS(" k ", " old ", " new ", '" table "')")])
+                          (first)
+                          (vals)
+                          (first))]
+                  (info "CAS result for" k ":" r)
                   (if r
-                    (assoc op
-                           :type  :ok
-                           :value (independent/tuple k value))
-                    (assoc op :type :fail)))))))
+                    (assoc op :type :ok :value (independent/tuple k value))
+                    (assoc op :type :fail))))))
+    (catch Exception e
+      (warn "Operation failed:" (.getMessage e))
+      (if (.getMessage e)
+        (let [msg (.getMessage e)]
+          (cond
+            (.contains msg "Quorum collection for a synchronous transaction is timed out")
+            (assoc op :type :info :error msg)
+            
+            (.contains msg "A rollback for a synchronous transaction is received")
+            (assoc op :type :info :error msg)
+            
+            :else
+            (assoc op :type :fail :error msg)))
+        (assoc op :type :fail :error :connection-error)))))
 
-  (teardown! [_ test]
-    (when-not (:leave-db-running? test)
-      (cl/with-conn-failure-retry conn
-        (j/execute! conn [(str "DROP TABLE IF EXISTS " table-name)]))))
+  (teardown! [this test]
+    (info (:node this) "Tearing down register client")
+    (let [{:keys [conn node]} this
+          primary  (first (db/primaries test))]
+      (when (and conn
+                 (not (:leave-db-running? test))
+                 (= node primary))
+        (info node "Dropping table")
+        (try
+          (cl/with-conn-failure-retry conn
+            (j/execute! conn
+              [(format "DROP TABLE IF EXISTS %s" table-name)]))
+          (catch Exception e
+            (warn node "Error dropping table:" (.getMessage e)))))))
 
-  (close! [_ test]))
+(close! [this test]
+  (info (:node this) "Closing register client")
+  (when-let [conn (:conn this)]
+    (try
+      (when (satisfies? java.io.Closeable conn)
+        (.close conn))
+      (catch Exception e
+        (warn (:node this) "Error closing connection:" (.getMessage e)))))))
 
 (defn workload
   [opts]

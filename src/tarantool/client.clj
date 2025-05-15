@@ -64,7 +64,6 @@
   [node]
   (let [conn (open node test)
         leader (:COLUMN_1 (first (sql/query conn ["SELECT _LEADER()"])))]
-    ;(assert leader)
     leader))
 
 (defmacro with-txn-aborts
@@ -119,9 +118,9 @@
   for those conditions."
  [conn & body]
  (assert (symbol? conn))
- (let [tries    (gensym 'tries) ; try count
-       e        (gensym 'e)     ; errors
-       conn-sym (gensym 'conn)  ; local conn reference
+ (let [tries    (gensym 'tries) 
+       e        (gensym 'e)     
+       conn-sym (gensym 'conn)  
        retry `(do (when (zero? ~tries)
                     (info "Out of retries!")
                     (throw ~e))
@@ -130,7 +129,7 @@
                   (~'retry (reopen! ~conn-sym) (dec ~tries)))]
  `(dt/with-retry [~conn-sym ~conn
                   ~tries    32]
-    (let [~conn ~conn-sym] ; Rebind the conn symbol to our current connection
+    (let [~conn ~conn-sym] 
       ~@body)
     (catch org.tarantool.CommunicationException ~e ~retry)
     (catch java.sql.BatchUpdateException ~e ~retry)
@@ -138,18 +137,16 @@
     (catch java.sql.SQLNonTransientConnectionException ~e ~retry)
     (catch java.sql.SQLException ~e
       (condp re-find (.getMessage ~e)
-        #"Resolve lock timeout"           ~retry ; high contention
-        #"Information schema is changed"  ~retry ; ???
-        #"called on closed connection"    ~retry ; definitely didn't happen
-        #"Region is unavailable"          ~retry ; okay fine
+        #"Resolve lock timeout"           ~retry 
+        #"Information schema is changed"  ~retry 
+        #"called on closed connection"    ~retry 
+        #"Region is unavailable"          ~retry 
         (do (info "with-conn-failure-retry isn't sure how to handle SQLException with message" (pr-str (class (.getMessage ~e))) (pr-str (.getMessage ~e)))
             (throw ~e)))))))
 
 (defn reopen!
   "Closes a connection and returns a new one based on the given connection."
   [conn]
-  ; Don't know how to close connection in next.jdbc
-  ;(close! conn)
   (open (::node conn) (::test conn)))
 
 (defmacro capture-txn-abort

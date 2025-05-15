@@ -56,8 +56,8 @@
 
 (def workloads-expected-to-pass
   "A collection of workload names which we expect should actually pass."
-  (remove #{:bank               ; https://github.com/tarantool/jepsen.tarantool/issues/83
-            :bank-multitable    ; https://github.com/tarantool/jepsen.tarantool/issues/83
+  (remove #{:bank             
+            :bank-multitable    
             } standard-workloads))
 
 (def nemeses
@@ -194,9 +194,9 @@
                                   (= (:workload opts) :register))
                              minimal-concurrency
                              (:concurrency opts))
-            :accounts  (vec (range 10)) ; bank-specific option
-            :max-transfer 5 ; bank-specific option
-            :total-amount 100 ; bank-specific option
+            :accounts  (vec (range 10))
+            :max-transfer 5 
+            :total-amount 100 
             :generator gen
             :checker   (checker/compose {:perf        (checker/perf {:nemeses (:perf nemesis)})
                                          :clock-skew  (checker/clock-plot)

@@ -6,6 +6,7 @@
             [tarantool.client :as cl]
             [jepsen.os.debian :as debian]
             [jepsen.control.util :as cu]
+            [jepsen.nemesis.time :as nt]
             [jepsen [core :as jepsen]
                     [control :as c]
                     [db :as db]
@@ -53,23 +54,23 @@
   []
   (info "Install prerequisites")
   (debian/install [:autoconf
-		   :automake
-		   :build-essential
-		   :cmake
-		   :coreutils
-		   :libtool
-		   :libreadline-dev
-		   :libncurses5-dev
-		   :libssl-dev
-		   :libunwind-dev
-		   :libicu-dev
-		   :make
-		   :sed
-		   :zlib1g-dev]))
+       :automake
+       :build-essential
+       :cmake
+       :coreutils
+       :libtool
+       :libreadline-dev
+       :libncurses5-dev
+       :libssl-dev
+       :libunwind-dev
+       :libicu-dev
+       :make
+       :sed
+       :zlib1g-dev]))
 
 (defn checkout-repo!
   "Checks out a repo at the given version into a directory in build/ named
-  `dir`. Returns the path to the build directory."
+  dir. Returns the path to the build directory."
   [repo-url dir version]
   (let [full-dir (str build-dir "/" dir)]
     (when-not (cu/exists? full-dir)
@@ -82,7 +83,7 @@
           (try+ (c/exec :git :checkout version)
                 (catch [:exit 1] e
                   (if (re-find #"pathspec .+ did not match any file" (:err e))
-                    (do ; Ah, we're out of date
+                    (do 
                         (c/exec :git :fetch)
                         (c/exec :git :checkout version))
                     (throw+ e)))))
@@ -103,89 +104,107 @@
   built by storing a file in the repo directory. Returns the result of body if
   evaluated, or the build directory."
   [node repo-name version & body]
-  `(util/with-named-lock build-locks [~node ~repo-name]
+  (util/with-named-lock build-locks [~node ~repo-name]
      (let [build-file# (str build-dir "/" ~repo-name "/" build-file)]
        (if (try+ (= (str ~version) (c/exec :cat build-file#))
-                (catch [:exit 1] e# ; Not found
+                (catch [:exit 1] e# 
                   false))
-         ; Already built
          (str build-dir "/" ~repo-name)
-         ; Build
          (let [res# (do ~@body)]
-           ; Log version
            (c/exec :echo ~version :> build-file#)
            res#)))))
 
-(defn build-tarantool!
-  "Build Tarantool from scratch"
-  [test node]
-  (let [version (:version test)]
-    (with-build-version node "tarantool" version
-      (let [dir (checkout-repo! tarantool-repo "tarantool" version)]
-        (install-build-prerequisites!)
-        (info "Building Tarantool" (:version test))
-        (c/cd dir
-          (c/exec :cmake :-DWITH_SYSTEMD:BOOL=ON
-			 :-DCMAKE_BUILD_TYPE=RelWithDebInfo
-			 :-DENABLE_DIST:BOOL=ON
-			 :-DENABLE_BACKTRACE:BOOL=ON
-			 "-DCMAKE_INSTALL_LOCALSTATEDIR:PATH=/var"
-			 "-DCMAKE_INSTALL_SYSCONFDIR:PATH=/etc"
-			 :.)
-          (c/exec :make :-j2)
-          (c/exec :make :install))
-        dir)))
-  (c/su
-      (c/exec :adduser
-		:--system
-		:--group
-		:--quiet
-		:--home "/var/spool/tarantool"
-		:--no-create-home
-		:--disabled-login
-		:tarantool)
-      (c/exec :install :-d :-otarantool :-gadm :-m2750 "/var/log/tarantool")
-      (c/exec :install :-d :-otarantool :-gadm :-m2750 "/var/run/tarantool")
-      (c/exec :install :-d :-otarantool :-gadm :-m2750 "/var/lib/tarantool")))
+(defn wait-dpkg-lock! []
+  (c/exec :bash :-c
+    (str
+      "while fuser /var/lib/dpkg/lock >/dev/null 2>&1 || "
+      "fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do\n"
+      "  echo 'waiting for dpkg lock'\n"
+      "  sleep 1\n"
+      "done")))
 
-(defn install-package!
-  "Installation using installer.sh"
-  [node version]
-  (info "Install Tarantool package version" version)
+(defn install! [node version]
   (c/su
-      (c/exec :curl :-O :-L "https://tarantool.io/installer.sh")
-      (c/exec :chmod :+x "./installer.sh")
-      (c/exec :env "DEBIAN_FRONTEND=noninteractive" (str "VER=" version) "./installer.sh")
-      (c/su (c/exec :systemctl :stop "tarantool@example"))))
+    (c/exec :sudo :systemctl :disable :--now
+          "apt-daily.timer" "apt-daily.service"
+          "apt-daily-upgrade.timer" "apt-daily-upgrade.service")
+    (wait-dpkg-lock!)
+    (c/exec :apt-get :-y :update)
+    (wait-dpkg-lock!)
+    (c/exec :apt-get :-y :--fix-broken :install)
+    (wait-dpkg-lock!)
+    (c/exec :apt-get :remove :--purge :-y :tarantool*)
+    (wait-dpkg-lock!)
+    (c/exec :apt-get :remove :tarantool-common :-y)
+    (wait-dpkg-lock!)
+    (c/exec :rm :-rf "/var/lib/apt/lists/*")
+    (wait-dpkg-lock!)
+    (c/exec :apt-get :clean)
+    (wait-dpkg-lock!)
+    (c/exec :bash :-c
+      "rm -f /etc/apt/sources.list.d/*tarantool*.list /etc/apt/sources.list.d/*bizmrg*")
+    (wait-dpkg-lock!)
+    (c/exec :apt-get :update)
+    (wait-dpkg-lock!)
+    (c/exec :apt-get :install :-y :gnupg2 :apt-transport-https)
+    (wait-dpkg-lock!)
+    (c/exec :apt-key :adv
+            :--fetch-keys
+            "https://download.tarantool.org/tarantool/release/series-2/gpgkey")
 
-(defn install!
-  "Tarantool installation, accepts branch version (like 2.6) or commit hash"
-  [node version]
-  (if (re-matches #"\d+\.\d+" version)
-	(install-package! node version)
-	(build-tarantool! node version)))
+    (let [codename (-> (c/exec :lsb_release :-sc)
+                      (clojure.string/trim))
+          repo-line (str "deb https://download.tarantool.org/"
+                        "tarantool/release/series-2/ubuntu/ "
+                        codename
+                        " main")]
+      (info "Writing tarantool.list:" repo-line)
+      (c/exec :bash :-c
+        (format "echo '%s' > /etc/apt/sources.list.d/tarantool.list"
+                repo-line)))
+
+    (wait-dpkg-lock!)
+    (c/exec :apt-get :update)
+    (wait-dpkg-lock!)
+    (try (c/exec :apt-get :-f :install :-y)
+         (catch Exception _ (info "Ignoring fix‑broken")))
+    (wait-dpkg-lock!)
+    (c/exec :apt-get :install :-y :tarantool))
+
+  (c/exec :tarantool :-v))
 
 (defn start!
   "Starts tarantool service"
   [test node]
-  (c/su (c/exec :systemctl :start "tarantool@jepsen")))
+  (c/su (c/exec :sudo :systemctl :start "tarantool@jepsen")))
 
 (defn restart!
   "Restarts tarantool service"
   [test node]
-  (c/su (c/exec :systemctl :restart "tarantool@jepsen")))
+  (c/su (c/exec :sudo :systemctl :restart "tarantool@jepsen")))
 
 (defn stop!
   "Stops tarantool service"
   [test node]
-    (c/su (c/exec :systemctl :stop "tarantool@jepsen" "||" "true")))
+    (c/su (c/exec :sudo :systemctl :stop "tarantool@jepsen" "||" "true")))
 
 (defn wipe!
   "Removes logs, data files and uninstall package"
   [test node]
-  (c/su (c/exec :rm :-rf logfile (c/lit (str data-dir "/*"))))
-  (c/su (c/exec :dpkg :--purge :--force-all :tarantool))
-  (c/su (c/exec :dpkg :--configure :-a)))
+  (c/exec :sudo :systemctl :disable :--now
+          "apt-daily.timer" "apt-daily.service"
+          "apt-daily-upgrade.timer" "apt-daily-upgrade.service")
+
+  (wait-dpkg-lock!)
+  (c/exec :sudo :apt-get :-y :remove :tarantool-dev :|| :true)
+
+  (wait-dpkg-lock!)
+  (c/exec :sudo :dpkg :--purge :--force-all :tarantool :|| :true)
+
+  (wait-dpkg-lock!)
+  (c/exec :sudo :dpkg :--configure :-a :|| :true)
+
+  (c/exec :sudo :rm :-rf logfile (str data-dir "/*")))
 
 (defn is-single-mode?
   [test]
@@ -211,35 +230,47 @@
        (double)
        (Math/round)))
 
-(defn configure!
-  "Configure instance"
-  [test node]
-    (info "Configure instance on" node)
-    (c/exec :mkdir :-p "/etc/tarantool/instances.available")
-    (c/exec :mkdir :-p "/etc/tarantool/instances.enabled")
-    (c/exec :usermod :-a :-G :tarantool :ubuntu)
-    (c/exec :echo (-> "tarantool/jepsen.lua" io/resource slurp
-                      (str/replace #"%TARANTOOL_QUORUM%" (str (calculate-quorum test)))
-                      (str/replace #"%TARANTOOL_IP_ADDRESS%" node)
-                      (str/replace #"%TARANTOOL_REPLICATION%" (replica-set test))
-                      (str/replace #"%TARANTOOL_MVCC%" (str (:mvcc test)))
-                      (str/replace #"%TARANTOOL_SINGLE_MODE%" (str (is-single-mode? test)))
-                      (str/replace #"%TARANTOOL_DATA_ENGINE%" (:engine test)))
-            :> "/etc/tarantool/instances.enabled/jepsen.lua")
-    (c/exec :cp "/etc/tarantool/instances.enabled/jepsen.lua" "/etc/tarantool/instances.available"))
+ (defn configure!
+   "Configure instance"
+   [test node]
+  (c/exec :sudo :mkdir  :-p data-dir)
+  (c/exec :sudo :chown :-R "tarantool:tarantool" data-dir)  
+  (c/exec :sudo :mkdir  :-p "/etc/tarantool/instances.available")
+  (c/exec :sudo :mkdir  :-p "/etc/tarantool/instances.enabled")
+  (let [conf (-> "tarantool/jepsen.lua" io/resource slurp
+                 (str/replace #"%TARANTOOL_QUORUM%"    (str (calculate-quorum test)))
+                 (str/replace #"%TARANTOOL_IP_ADDRESS%" node)
+                 (str/replace #"%TARANTOOL_REPLICATION%" (replica-set test))
+                 (str/replace #"%TARANTOOL_MVCC%"       (str (:mvcc test)))
+                 (str/replace #"%TARANTOOL_SINGLE_MODE%" (str (is-single-mode? test)))
+                 (str/replace #"%TARANTOOL_DATA_ENGINE%" (:engine test))
+                 (str/replace #"%TARANTOOL_DATA_DIR%"    data-dir))]    
+    (c/exec :sudo :bash :-c
+      (format "cat > /etc/tarantool/instances.enabled/jepsen.lua << 'EOF'\n%s\nEOF"
+              conf)))
+   (c/exec :sudo :cp "/etc/tarantool/instances.enabled/jepsen.lua"
+                    "/etc/tarantool/instances.available"))
 
 (defn db
   "Tarantool DB for a particular version."
   [version]
   (reify db/DB
-
     (setup! [_ test node]
-      (info node "Starting Tarantool" version)
+      (info node "Setting up Tarantool" version)
       (c/su
+        (wait-dpkg-lock!)
+        (c/exec :apt-get :-y :update)
+        (wait-dpkg-lock!)
+        (c/exec :apt-get :-y :autoremove :tarantool-dev)
+        (wait-dpkg-lock!)
+        (c/exec :apt-get :-y "--fix-broken" :install))
+
         (install! node version)
         (configure! test node)
-        (start! test node)
-        (Thread/sleep 10000)))
+        (c/exec :sudo :systemctl :daemon-reload)
+        (c/exec :sudo :systemctl :start "tarantool@jepsen")
+        (c/exec :bash :-c
+          "until nc -z localhost 3301; do echo 'waiting for tarantool'; sleep 1; done"))
 
     (teardown! [_ test node]
       (info node "Stopping Tarantool")
